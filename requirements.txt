@@ -1,0 +1,17 @@
+torch
+torchvision
+transformers
+numpy
+pandas
+opencv-python-headless
+scikit-learn
+tqdm
+matplotlib
+Pillow
+nltk
+pretrainedmodels
+wandb
+albumentations
+torchtoolbox
+pytorch-lightning
+tensorboard

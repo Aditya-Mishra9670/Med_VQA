@@ -1,5 +1,15 @@
 import argparse
-from utils import seed_everything, Model, VQAMed, train_one_epoch, validate, test, load_data, LabelSmoothing
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'vqamed2019'))
+sys.path.insert(0, os.path.dirname(__file__))
+
+from path_config import configure_huggingface_cache, default_checkpoint_dir, default_converted_data_dir, default_hf_cache_dir, default_output_dir, select_device
+
+configure_huggingface_cache(default_hf_cache_dir())
+from utils import seed_everything, Model, VQAMed, train_one_epoch, validate, test, load_data, LabelSmoothing, make_grad_scaler
 import wandb
 import pandas as pd
 import numpy as np
@@ -9,10 +19,6 @@ from torch.utils.data import DataLoader, Dataset
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 from torchvision import transforms, models
-from torch.cuda.amp import GradScaler
-from torchtoolbox.transform import Cutout
-import os
-import pytorch_lightning as pl
 import warnings
 
 warnings.simplefilter("ignore", UserWarning)
@@ -24,13 +30,17 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = "Evaluate")
 
     parser.add_argument('--run_name', type = str, required = True, help = "run name for wandb")
-    parser.add_argument('--data_dir', type = str, required = False, default = "/home/roboticslab/Documents/MED-VQA/dataset/med-vqa-data", help = "path for data")
-    parser.add_argument('--model_dir', type = str, required = False, default = "/home/roboticslab/Documents/Weights/ic19/exp01_ic19_mlm_abnorm_acc.pt", help = "path to load weights")
-    parser.add_argument('--save_dir', type = str, required = False, default = "/home/viraj.bagal/viraj/medvqa/Weights/ic19", help = "path to save weights")
+    parser.add_argument('--data_dir', '--converted_data_dir', dest='data_dir', type = str, required = False, default = str(default_converted_data_dir()), help = "path for converted data")
+    parser.add_argument('--model_dir', type = str, required = False, default = None, help = "path to load weights")
+    parser.add_argument('--save_dir', '--checkpoint_dir', dest='save_dir', type = str, required = False, default = str(default_checkpoint_dir()), help = "path to save weights")
+    parser.add_argument('--output_dir', type = str, required = False, default = str(default_output_dir()), help = "path to save evaluation outputs")
+    parser.add_argument('--cache_dir', type = str, required = False, default = None, help = "cache directory")
     parser.add_argument('--category', type = str, required = False, default = None,  help = "choose specific category if you want")
     parser.add_argument('--use_pretrained', action = 'store_true', default = False, help = "use pretrained weights or not")
     parser.add_argument('--mixed_precision', action = 'store_true', default = False, help = "use mixed precision or not")
     parser.add_argument('--clip', action = 'store_true', default = False, help = "clip the gradients or not")
+    parser.add_argument('--wandb', action = 'store_true', default = False, help = "enable Weights & Biases logging")
+    parser.add_argument('--allow_directml', action = 'store_true', default = False, help = "allow DirectML as a local fallback when CUDA is unavailable")
 
     parser.add_argument('--seed', type = int, required = False, default = 42, help = "set seed for reproducibility")
     parser.add_argument('--num_workers', type = int, required = False, default = 4, help = "number of workers")
@@ -55,11 +65,20 @@ if __name__ == '__main__':
     parser.add_argument('--type_vocab_size', type = int, required = False, default = 2, help = "type vocab size")
     parser.add_argument('--heads', type = int, required = False, default = 12, help = "heads")
     parser.add_argument('--n_layers', type = int, required = False, default = 4, help = "num of layers")
+    parser.add_argument('--num_vis', type = int, required = False, default = 1, help = "num of visual embeddings")
 
 
     args = parser.parse_args()
+    args.data_dir = str(Path(args.data_dir).expanduser())
+    args.save_dir = str(Path(args.save_dir).expanduser())
+    args.output_dir = str(Path(args.output_dir).expanduser())
+    cache_dir = Path(args.cache_dir).expanduser() if args.cache_dir else None
+    configure_huggingface_cache(default_hf_cache_dir(cache_dir))
+    os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    wandb.init(project='medvqa', name = args.run_name, config = args)
+    if args.wandb:
+        wandb.init(project='medvqa', name = args.run_name, config = args)
 
     seed_everything(args.seed)
 
@@ -93,19 +112,23 @@ if __name__ == '__main__':
 
     train_df = pd.concat([train_df, val_df]).reset_index(drop=True)
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = select_device(args.allow_directml)
+    print(f"Using device: {device}")
 
     model = Model(args)
 
     model.classifier[2] = nn.Linear(args.hidden_size, num_classes)
 
     if args.use_pretrained:
+        if not args.model_dir:
+            raise ValueError("--model_dir is required when --use_pretrained is set")
         model.load_state_dict(torch.load(args.model_dir))
 
         
     model.to(device)
 
-    wandb.watch(model, log='all')
+    if args.wandb:
+        wandb.watch(model, log='all')
 
 
     optimizer = optim.Adam(model.parameters(),lr=args.lr)
@@ -117,7 +140,7 @@ if __name__ == '__main__':
     else:
         criterion = nn.CrossEntropyLoss()
 
-    scaler = GradScaler()
+    scaler = make_grad_scaler(device, args.mixed_precision)
 
 
     test_tfm = transforms.Compose([transforms.ToTensor(), 
@@ -140,7 +163,8 @@ if __name__ == '__main__':
     test_df['preds'] = predictions
     test_df['decode_preds'] = test_df['preds'].map(idx2ans)
     test_df['decode_ans'] = test_df['answer'].map(idx2ans)
-    test_df.to_csv(f'test_csvs/{args.category}_test_mlm_preds.csv', index = False)
+    output_name = f"{args.category or 'all'}_test_mlm_preds.csv"
+    test_df.to_csv(os.path.join(args.output_dir, output_name), index = False)
 
 
             

@@ -14,6 +14,7 @@ import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import torch.nn.functional as F
 from transformers import BertTokenizer, BertModel
+from transformers.utils import logging as transformers_logging
 from nltk.translate.bleu_score import sentence_bleu
 from tqdm import tqdm
 from PIL import Image
@@ -22,6 +23,9 @@ import matplotlib.pyplot as plt
 
 import pretrainedmodels
 
+transformers_logging.set_verbosity_error()
+transformers_logging.disable_progress_bar()
+
 
 def seed_everything(seed):
     random.seed(seed)
@@ -29,9 +33,11 @@ def seed_everything(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     random.seed(seed)
-    torch.cuda.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
 
 
 
@@ -71,9 +77,10 @@ def load_data(args, remove = None):
     valdf['answer'] = valdf['answer'].str.lower()
     testdf['answer'] = testdf['answer'].str.lower()
 
-    traindf = traindf.sample(frac = args.train_pct)
-    valdf = valdf.sample(frac = args.valid_pct)
-    testdf = testdf.sample(frac = args.test_pct)
+    seed = getattr(args, 'seed', 42)
+    traindf = traindf.sample(frac = args.train_pct, random_state=seed)
+    valdf = valdf.sample(frac = args.valid_pct, random_state=seed)
+    testdf = testdf.sample(frac = args.test_pct, random_state=seed)
 
 
     return traindf, valdf, testdf
@@ -217,7 +224,7 @@ class VQAMed(Dataset):
         self.tfm = tfm
         self.size = imgsize
         self.args = args
-        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.tokenizer = load_bert_tokenizer()
         self.mode = mode
 
     def __len__(self):
@@ -253,7 +260,7 @@ class VQAMed_Binary(Dataset):
         self.tfm = tfm
         self.size = imgsize
         self.args = args
-        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.tokenizer = load_bert_tokenizer()
         self.mode = mode
 
     def __len__(self):
@@ -316,8 +323,50 @@ class Model_Keyword(nn.Module):
 
 
 def calculate_bleu_score(preds,targets, idx2ans):
+  if len(preds) == 0:
+    return np.nan
   bleu_per_answer = np.asarray([sentence_bleu([idx2ans[target].split()],idx2ans[pred].split(), weights = [1]) for pred,target in zip(preds,targets)])
   return np.mean(bleu_per_answer)
+
+
+def calculate_accuracy(preds, targets):
+    if len(preds) == 0:
+        return np.nan
+    return (preds == targets).mean() * 100.
+
+
+def category_values(preds, targets, categories, category_name):
+    mask = categories == category_name
+    return preds[mask], targets[mask]
+
+
+def make_grad_scaler(device, enabled=False):
+    use_cuda_amp = enabled and str(device).startswith('cuda')
+    try:
+        return torch.amp.GradScaler('cuda', enabled=use_cuda_amp)
+    except (AttributeError, TypeError):
+        return GradScaler(enabled=use_cuda_amp)
+
+
+def load_resnet152_imagenet():
+    try:
+        return models.resnet152(weights=models.ResNet152_Weights.IMAGENET1K_V1)
+    except AttributeError:
+        return models.resnet152(pretrained=True)
+
+
+def load_bert_tokenizer():
+    try:
+        return BertTokenizer.from_pretrained('bert-base-uncased', local_files_only=True)
+    except OSError:
+        return BertTokenizer.from_pretrained('bert-base-uncased')
+
+
+def load_bert_model():
+    try:
+        return BertModel.from_pretrained('bert-base-uncased', local_files_only=True)
+    except OSError:
+        return BertModel.from_pretrained('bert-base-uncased')
 
 
 
@@ -355,7 +404,7 @@ class Transfer(nn.Module):
 
         self.args = args
         self.num_vis = args.num_vis
-        self.model = models.resnet152(pretrained=True)
+        self.model = load_resnet152_imagenet()
         # for p in self.parameters():
         #     p.requires_grad=False
 
@@ -530,7 +579,7 @@ class BertLayer(nn.Module):
 class Transformer(nn.Module):
     def __init__(self, args):
         super(Transformer,self).__init__()
-        base_model = BertModel.from_pretrained('bert-base-uncased')
+        base_model = load_bert_model()
         bert_model = nn.Sequential(*list(base_model.children())[0:])
         self.bert_embedding = bert_model[0]
         # self.embed = Embeddings(args)
@@ -717,26 +766,33 @@ def validate(loader, model, criterion, device, scaler, args, val_df, idx2ans):
 
     # Calculate total and category wise accuracy
     if args.category:
-        acc = (PREDS == TARGETS).mean() * 100.
+        acc = calculate_accuracy(PREDS, TARGETS)
         bleu = calculate_bleu_score(PREDS,TARGETS,idx2ans)
     else:
-        total_acc = (PREDS == TARGETS).mean() * 100.
-        binary_acc = (PREDS[val_df['category']=='binary'] == TARGETS[val_df['category']=='binary']).mean() * 100.
-        plane_acc = (PREDS[val_df['category']=='plane'] == TARGETS[val_df['category']=='plane']).mean() * 100.
-        organ_acc = (PREDS[val_df['category']=='organ'] == TARGETS[val_df['category']=='organ']).mean() * 100.
-        modality_acc = (PREDS[val_df['category']=='modality'] == TARGETS[val_df['category']=='modality']).mean() * 100.
-        abnorm_acc = (PREDS[val_df['category']=='abnormality'] == TARGETS[val_df['category']=='abnormality']).mean() * 100.
+        categories = val_df['category'].to_numpy()
+        binary_preds, binary_targets = category_values(PREDS, TARGETS, categories, 'binary')
+        plane_preds, plane_targets = category_values(PREDS, TARGETS, categories, 'plane')
+        organ_preds, organ_targets = category_values(PREDS, TARGETS, categories, 'organ')
+        modality_preds, modality_targets = category_values(PREDS, TARGETS, categories, 'modality')
+        abnorm_preds, abnorm_targets = category_values(PREDS, TARGETS, categories, 'abnormality')
+
+        total_acc = calculate_accuracy(PREDS, TARGETS)
+        binary_acc = calculate_accuracy(binary_preds, binary_targets)
+        plane_acc = calculate_accuracy(plane_preds, plane_targets)
+        organ_acc = calculate_accuracy(organ_preds, organ_targets)
+        modality_acc = calculate_accuracy(modality_preds, modality_targets)
+        abnorm_acc = calculate_accuracy(abnorm_preds, abnorm_targets)
 
         acc = {'val_total_acc': np.round(total_acc, 4), 'val_binary_acc': np.round(binary_acc, 4), 'val_plane_acc': np.round(plane_acc, 4), 'val_organ_acc': np.round(organ_acc, 4), 
                'val_modality_acc': np.round(modality_acc, 4), 'val_abnorm_acc': np.round(abnorm_acc, 4)}
 
         # add bleu score code
         total_bleu = calculate_bleu_score(PREDS,TARGETS,idx2ans)
-        plane_bleu = calculate_bleu_score(PREDS[val_df['category']=='plane'],TARGETS[val_df['category']=='plane'],idx2ans)
-        binary_bleu = calculate_bleu_score(PREDS[val_df['category']=='binary'],TARGETS[val_df['category']=='binary'],idx2ans)
-        organ_bleu = calculate_bleu_score(PREDS[val_df['category']=='organ'],TARGETS[val_df['category']=='organ'],idx2ans)
-        modality_bleu = calculate_bleu_score(PREDS[val_df['category']=='modality'],TARGETS[val_df['category']=='modality'],idx2ans)
-        abnorm_bleu = calculate_bleu_score(PREDS[val_df['category']=='abnormality'],TARGETS[val_df['category']=='abnormality'],idx2ans)
+        plane_bleu = calculate_bleu_score(plane_preds, plane_targets,idx2ans)
+        binary_bleu = calculate_bleu_score(binary_preds, binary_targets,idx2ans)
+        organ_bleu = calculate_bleu_score(organ_preds, organ_targets,idx2ans)
+        modality_bleu = calculate_bleu_score(modality_preds, modality_targets,idx2ans)
+        abnorm_bleu = calculate_bleu_score(abnorm_preds, abnorm_targets,idx2ans)
 
 
         bleu = {'val_total_bleu': np.round(total_bleu, 4), 'val_binary_bleu': np.round(binary_bleu, 4), 'val_plane_bleu': np.round(plane_bleu, 4), 'val_organ_bleu': np.round(organ_bleu, 4), 
@@ -788,26 +844,33 @@ def test(loader, model, criterion, device, scaler, args, val_df,idx2ans):
     TARGETS = torch.cat(TARGETS).cpu().numpy()
 
     if args.category:
-        acc = (PREDS == TARGETS).mean() * 100.
+        acc = calculate_accuracy(PREDS, TARGETS)
         bleu = calculate_bleu_score(PREDS,TARGETS,idx2ans)
     else:
-        total_acc = (PREDS == TARGETS).mean() * 100.
-        binary_acc = (PREDS[val_df['category']=='binary'] == TARGETS[val_df['category']=='binary']).mean() * 100.
-        plane_acc = (PREDS[val_df['category']=='plane'] == TARGETS[val_df['category']=='plane']).mean() * 100.
-        organ_acc = (PREDS[val_df['category']=='organ'] == TARGETS[val_df['category']=='organ']).mean() * 100.
-        modality_acc = (PREDS[val_df['category']=='modality'] == TARGETS[val_df['category']=='modality']).mean() * 100.
-        abnorm_acc = (PREDS[val_df['category']=='abnormality'] == TARGETS[val_df['category']=='abnormality']).mean() * 100.
+        categories = val_df['category'].to_numpy()
+        binary_preds, binary_targets = category_values(PREDS, TARGETS, categories, 'binary')
+        plane_preds, plane_targets = category_values(PREDS, TARGETS, categories, 'plane')
+        organ_preds, organ_targets = category_values(PREDS, TARGETS, categories, 'organ')
+        modality_preds, modality_targets = category_values(PREDS, TARGETS, categories, 'modality')
+        abnorm_preds, abnorm_targets = category_values(PREDS, TARGETS, categories, 'abnormality')
+
+        total_acc = calculate_accuracy(PREDS, TARGETS)
+        binary_acc = calculate_accuracy(binary_preds, binary_targets)
+        plane_acc = calculate_accuracy(plane_preds, plane_targets)
+        organ_acc = calculate_accuracy(organ_preds, organ_targets)
+        modality_acc = calculate_accuracy(modality_preds, modality_targets)
+        abnorm_acc = calculate_accuracy(abnorm_preds, abnorm_targets)
 
         acc = {'total_acc': np.round(total_acc, 4), 'binary_acc': np.round(binary_acc, 4), 'plane_acc': np.round(plane_acc, 4), 'organ_acc': np.round(organ_acc, 4), 
                'modality_acc': np.round(modality_acc, 4), 'abnorm_acc': np.round(abnorm_acc, 4)}
 
         # add bleu score code
         total_bleu = calculate_bleu_score(PREDS,TARGETS,idx2ans)
-        binary_bleu = calculate_bleu_score(PREDS[val_df['category']=='binary'],TARGETS[val_df['category']=='binary'],idx2ans)
-        plane_bleu = calculate_bleu_score(PREDS[val_df['category']=='plane'],TARGETS[val_df['category']=='plane'],idx2ans)
-        organ_bleu = calculate_bleu_score(PREDS[val_df['category']=='organ'],TARGETS[val_df['category']=='organ'],idx2ans)
-        modality_bleu = calculate_bleu_score(PREDS[val_df['category']=='modality'],TARGETS[val_df['category']=='modality'],idx2ans)
-        abnorm_bleu = calculate_bleu_score(PREDS[val_df['category']=='abnormality'],TARGETS[val_df['category']=='abnormality'],idx2ans)
+        binary_bleu = calculate_bleu_score(binary_preds, binary_targets,idx2ans)
+        plane_bleu = calculate_bleu_score(plane_preds, plane_targets,idx2ans)
+        organ_bleu = calculate_bleu_score(organ_preds, organ_targets,idx2ans)
+        modality_bleu = calculate_bleu_score(modality_preds, modality_targets,idx2ans)
+        abnorm_bleu = calculate_bleu_score(abnorm_preds, abnorm_targets,idx2ans)
 
 
         bleu = {'total_bleu': np.round(total_bleu, 4),  'binary_bleu': np.round(binary_bleu, 4), 'plane_bleu': np.round(plane_bleu, 4), 'organ_bleu': np.round(organ_bleu, 4), 

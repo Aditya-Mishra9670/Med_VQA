@@ -1,5 +1,16 @@
 import argparse
-from utils import seed_everything, Model, VQAMed, train_one_epoch, validate, test, load_data, LabelSmoothing, train_img_only, val_img_only, test_img_only
+import os
+import sys
+from pathlib import Path
+
+MMBERT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(MMBERT_DIR))
+
+from path_config import configure_huggingface_cache, default_checkpoint_dir, default_converted_data_dir, default_hf_cache_dir, default_output_dir, select_device
+
+configure_huggingface_cache(default_hf_cache_dir())
+
+from utils import seed_everything, Model, VQAMed, train_one_epoch, validate, test, load_data, LabelSmoothing, train_img_only, val_img_only, test_img_only, make_grad_scaler
 import wandb
 import pandas as pd
 import numpy as np
@@ -9,8 +20,6 @@ from torch.utils.data import DataLoader, Dataset
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 from torchvision import transforms, models
-from torch.cuda.amp import GradScaler
-import os
 import warnings
 import albumentations as A
 import pretrainedmodels
@@ -20,19 +29,33 @@ from albumentations.pytorch.transforms import ToTensorV2
 warnings.simplefilter("ignore", UserWarning)
 
 
+def primary_val_score(val_acc):
+    if isinstance(val_acc, dict):
+        return val_acc.get('val_total_acc', val_acc.get('total_acc', 0))
+    return val_acc
+
+
+def log_wandb(metrics):
+    if wandb.run is not None:
+        wandb.log(metrics)
+
 
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description = "Finetune on ImageClef 2019")
 
-    # parser.add_argument('--run_name', type = str, required = True, help = "run name for wandb")
-    parser.add_argument('--data_dir', type = str, required = False, default = "/home/terasquid/med-VQA/Dataset/VQA-Med-2019-master", help = "path for data")
-    parser.add_argument('--model_dir', type = str, required = False, default = "/home/terasquid/med-VQA/Weights/roco_mlm/val_loss_3.pt", help = "path to load weights")
-    parser.add_argument('--save_dir', type = str, required = False, default = "/home/terasquid/med-VQA/Weights/ic19", help = "path to save weights")
+    parser.add_argument('--run_name', type = str, required = False, default = "model", help = "run name for wandb")
+    parser.add_argument('--data_dir', '--converted_data_dir', dest='data_dir', type = str, required = False, default = str(default_converted_data_dir()), help = "path for converted data")
+    parser.add_argument('--model_dir', type = str, required = False, default = None, help = "path to load pretrained weights")
+    parser.add_argument('--save_dir', '--checkpoint_dir', dest='save_dir', type = str, required = False, default = str(default_checkpoint_dir()), help = "path to save weights")
+    parser.add_argument('--output_dir', type = str, required = False, default = str(default_output_dir()), help = "path to save generated outputs")
+    parser.add_argument('--cache_dir', type = str, required = False, default = None, help = "cache directory")
     parser.add_argument('--category', type = str, required = False, default = None,  help = "choose specific category if you want")
     parser.add_argument('--use_pretrained', action = 'store_true', default = False, help = "use pretrained weights or not")
     parser.add_argument('--mixed_precision', action = 'store_true', default = False, help = "use mixed precision or not")
     parser.add_argument('--clip', action = 'store_true', default = False, help = "clip the gradients or not")
+    parser.add_argument('--wandb', action = 'store_true', default = False, help = "enable Weights & Biases logging")
+    parser.add_argument('--allow_directml', action = 'store_true', default = False, help = "allow DirectML as a local fallback when CUDA is unavailable")
 
     parser.add_argument('--seed', type = int, required = False, default = 42, help = "set seed for reproducibility")
     parser.add_argument('--num_workers', type = int, required = False, default = 4, help = "number of workers")
@@ -60,8 +83,16 @@ if __name__ == '__main__':
     parser.add_argument('--num_vis', type = int, required = True, help = "num of visual embeddings")
 
     args = parser.parse_args()
+    args.data_dir = str(Path(args.data_dir).expanduser())
+    args.save_dir = str(Path(args.save_dir).expanduser())
+    args.output_dir = str(Path(args.output_dir).expanduser())
+    cache_dir = Path(args.cache_dir).expanduser() if args.cache_dir else None
+    configure_huggingface_cache(default_hf_cache_dir(cache_dir))
+    os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    # wandb.init(project='medvqa', name = args.run_name, config = args)
+    if args.wandb:
+        wandb.init(project='medvqa', name = args.run_name, config = args)
 
     seed_everything(args.seed)
 
@@ -92,11 +123,14 @@ if __name__ == '__main__':
 
 
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = select_device(args.allow_directml)
+    print(f"Using device: {device}")
 
     model = Model(args)
 
     if args.use_pretrained:
+        if not args.model_dir:
+            raise ValueError("--model_dir is required when --use_pretrained is set")
         model.load_state_dict(torch.load(args.model_dir))
 
 
@@ -106,11 +140,12 @@ if __name__ == '__main__':
         
     model.to(device)
 
-    # wandb.watch(model, log='all')
+    if args.wandb:
+        wandb.watch(model, log='all')
 
 
     optimizer = optim.Adam(model.parameters(),lr=args.lr)
-    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, patience = args.patience, factor = args.factor, verbose = True)
+    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, patience = args.patience, factor = args.factor)
 
 
     if args.smoothing:
@@ -118,7 +153,7 @@ if __name__ == '__main__':
     else:
         criterion = nn.CrossEntropyLoss()
 
-    scaler = GradScaler()
+    scaler = make_grad_scaler(device, args.mixed_precision)
 
 
     train_tfm = transforms.Compose([
@@ -164,7 +199,7 @@ if __name__ == '__main__':
         train_loss, _, _, _, _ = train_one_epoch(trainloader, model, optimizer, criterion, device, scaler, args, idx2ans)
         val_loss, predictions, val_acc, val_bleu = validate(valloader, model, criterion, device, scaler, args, val_df,idx2ans)
         test_loss, predictions, acc, bleu = test(testloader, model, criterion, device, scaler, args, test_df,idx2ans)
-
+        val_score = primary_val_score(val_acc)
         scheduler.step(val_loss)
      
 
@@ -179,39 +214,39 @@ if __name__ == '__main__':
             log_dict['test_loss'] = test_loss
             log_dict['learning_rate'] = optimizer.param_groups[0]["lr"]
 
-            # wandb.log(log_dict)
+            log_wandb(log_dict)
 
-        # else:
+        else:
 
-            # wandb.log({'train_loss': train_loss,
-            #             'val_loss': val_loss,
-            #             'test_loss': test_loss,
-            #             'learning_rate': optimizer.param_groups[0]["lr"],
-            #             f'val_{args.category}_acc': val_acc,
-            #             f'val_{args.category}_bleu': val_bleu,
-            #             f'{args.category}_acc': acc,
-            #             f'{args.category}_bleu': bleu}) 
+            log_wandb({'train_loss': train_loss,
+                        'val_loss': val_loss,
+                        'test_loss': test_loss,
+                        'learning_rate': optimizer.param_groups[0]["lr"],
+                        f'val_{args.category}_acc': val_acc,
+                        f'val_{args.category}_bleu': val_bleu,
+                        f'{args.category}_acc': acc,
+                        f'{args.category}_bleu': bleu}) 
 
 
 
         if not args.category:
-
-            if val_acc['total_acc'] > best_acc1:
+            # print("val_acc =", val_acc)
+            # print("type =", type(val_acc))
+            if val_score > best_acc1:
                 torch.save(model.state_dict(),os.path.join(args.save_dir, f'{args.run_name}_acc.pt'))
-                best_acc1=val_acc['total_acc']
+                best_acc1 = val_score
 
         else:
 
-            if val_acc > best_acc1:
+            if val_score > best_acc1:
                 print('Saving model')
                 torch.save(model.state_dict(),os.path.join(args.save_dir, f'{args.run_name}_acc.pt'))
-                best_acc1 = val_acc 
+                best_acc1 = val_score
 
 
-
-        if val_acc > best_acc2:
+        if val_score > best_acc2:
             counter = 0
-            best_acc2 = val_acc
+            best_acc2 = val_score
         else:
             counter+=1
             if counter > 20:
