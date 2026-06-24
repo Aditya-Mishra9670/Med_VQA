@@ -13,15 +13,24 @@ PROJECT_ROOT = MMBERT_DIR.parent
 KAGGLE_INPUT = Path("/kaggle/input")
 KAGGLE_WORKING = Path("/kaggle/working")
 
+# Fixed Kaggle dataset and model paths
+KAGGLE_DATASET_ROOT = KAGGLE_INPUT / "datasets/systemsuperadmin/med-vqa-data"
+KAGGLE_MODEL_DIR = KAGGLE_INPUT / "models/systemsuperadmin/med-vqa-50-epoch-model/pytorch/default/1"
+
 
 def is_kaggle() -> bool:
     return KAGGLE_INPUT.exists() and KAGGLE_WORKING.exists()
 
 
 def find_kaggle_dataset_root() -> Optional[Path]:
+    """Return the fixed Kaggle dataset path, falling back to a glob search."""
     if not KAGGLE_INPUT.exists():
         return None
 
+    if KAGGLE_DATASET_ROOT.is_dir():
+        return KAGGLE_DATASET_ROOT
+
+    # Fallback: search for vqa-med-2019 anywhere under /kaggle/input
     candidates = sorted(KAGGLE_INPUT.glob("**/vqa-med-2019"))
     for candidate in candidates:
         if candidate.is_dir():
@@ -38,7 +47,7 @@ def default_dataset_root() -> Path:
         kaggle_root = find_kaggle_dataset_root()
         if kaggle_root is not None:
             return kaggle_root
-        return KAGGLE_INPUT
+        return KAGGLE_DATASET_ROOT  # best-effort even if not yet mounted
 
     return PROJECT_ROOT / "med-vqa-data" / "vqa-med-2019"
 
@@ -51,7 +60,7 @@ def default_converted_data_dir() -> Path:
 
 def default_checkpoint_dir() -> Path:
     if is_kaggle():
-        return KAGGLE_WORKING / "mmbert" / "checkpoints"
+        return KAGGLE_MODEL_DIR
     return MMBERT_DIR / "checkpoints"
 
 
@@ -79,7 +88,7 @@ def add_path_args(parser: argparse.ArgumentParser, *, dataset_root: bool = True)
             "--dataset_root",
             type=Path,
             default=None,
-            help="Raw VQA-Med-2019 dataset root. Defaults to local med-vqa-data/vqa-med-2019 or auto-detected /kaggle/input/**/vqa-med-2019.",
+            help="Raw VQA-Med-2019 dataset root. On Kaggle defaults to /kaggle/input/datasets/systemsuperadmin/med-vqa-data; locally defaults to med-vqa-data/vqa-med-2019.",
         )
     parser.add_argument(
         "--converted_data_dir",
@@ -126,8 +135,12 @@ def resolve_path_args(args: argparse.Namespace, *, create: bool = True) -> argpa
     args.hf_cache_dir = default_hf_cache_dir(args.cache_dir)
 
     if create:
-        for path in (args.converted_data_dir, args.checkpoint_dir, args.output_dir, args.cache_dir, args.hf_cache_dir):
+        # checkpoint_dir may be a read-only Kaggle input mount — skip mkdir for it
+        writable_paths = (args.converted_data_dir, args.output_dir, args.cache_dir, args.hf_cache_dir)
+        for path in writable_paths:
             path.mkdir(parents=True, exist_ok=True)
+        if not is_kaggle():
+            args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     configure_huggingface_cache(args.hf_cache_dir)
     return args
